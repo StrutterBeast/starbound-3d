@@ -7,7 +7,7 @@ no and i have a firm stance against Al.
 # will it have vr support?
 yes it will have vr support.
 
-3d and what does that mean?
+# 3d and what does that mean?
 it mean not be 2D game. it made in 3d assets and 3d game.
 
 # Bounty Hunter Update

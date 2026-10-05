@@ -1,0 +1,1180 @@
+#include "StarUniverseClient.hpp"
+#include "StarLexicalCast.hpp"
+#include "StarJsonExtra.hpp"
+#include "StarLogging.hpp"
+#include "StarVersion.hpp"
+#include "StarRoot.hpp"
+#include "StarConfiguration.hpp"
+#include "StarProjectileDatabase.hpp"
+#include "StarPlayerStorage.hpp"
+#include "StarPlayer.hpp"
+#include "StarPlayerLog.hpp"
+#include "StarAssets.hpp"
+#include "StarFile.hpp"
+#include "StarTime.hpp"
+#include "StarNetPackets.hpp"
+#include "StarTcp.hpp"
+#include "StarWorldClient.hpp"
+#include "StarSystemWorldClient.hpp"
+#include "StarClientContext.hpp"
+#include "StarTeamClient.hpp"
+#include "StarSha256.hpp"
+#include "StarEncode.hpp"
+#include "StarPlayerCodexes.hpp"
+#include "StarQuestManager.hpp"
+#include "StarPlayerUniverseMap.hpp"
+#include "StarWorldTemplate.hpp"
+
+#include "StarUniverseClientLuaBindings.hpp"
+
+namespace Star {
+
+UniverseClient::UniverseClient(PlayerStoragePtr playerStorage, StatisticsPtr statistics, String const& universeClientStorageDir) {
+  m_storageTriggerDeadline = 0;
+  m_playerStorage = std::move(playerStorage);
+  m_statistics = std::move(statistics);
+  m_storageDirectory = universeClientStorageDir;
+  m_pause = make_shared<atomic<bool>>(false);
+  m_luaRoot = make_shared<LuaRoot>();
+  m_subWorldThreads = IdMap<ClientSubWorldId,WorldClientThreadPtr>(MinClientSubWorldId,MaxClientSubWorldId);
+  
+  String const lockFile = "universe.lock";
+  
+  if (!File::isDirectory(m_storageDirectory)) {
+    Logger::info("UniverseClient: Creating universe client storage directory");
+    File::makeDirectory(m_storageDirectory);
+  }
+  
+  m_storageDirectoryLock = LockFile::acquireLock(File::relativeTo(m_storageDirectory, lockFile));
+  if (!m_storageDirectoryLock) {
+    Logger::warn("Could not acquire lock for the universe client directory. Client custom worlds and consistent client uuid are disabled.");
+  } else {
+    auto versioningDatabase = Root::singleton().versioningDatabase();
+    auto storageFile = File::relativeTo(m_storageDirectory, "universeclient.dat");
+    if (File::isFile(storageFile)) {
+      try {
+        auto settings = versioningDatabase->loadVersionedJson(VersionedJson::readFile(storageFile), "UniverseClientSettings");
+        m_uuid = Uuid(settings.getString("uuid"));
+      } catch (std::exception const& e) {
+        Logger::error("UniverseClient: Could not load universe settings file, loading defaults {}", outputException(e, false));
+        File::rename(storageFile, strf("{}.{}.fail", storageFile, Time::millisecondsSinceEpoch()));
+      }
+    } else {
+    }
+  }
+  reset();
+}
+
+UniverseClient::~UniverseClient() {
+  disconnect();
+  if (m_storageDirectoryLock) {
+    auto versioningDatabase = Root::singleton().versioningDatabase();
+    auto versionedSettings = versioningDatabase->makeCurrentVersionedJson("UniverseClientSettings",
+    JsonObject{
+      {"uuid",m_uuid.hex()}
+    });
+    VersionedJson::writeFile(versionedSettings, File::relativeTo(m_storageDirectory, "universeclient.dat"));
+  }
+}
+
+void UniverseClient::setMainPlayer(PlayerPtr player) {
+  if (isConnected())
+    throw StarException("Cannot call UniverseClient::setMainPlayer while connected");
+
+  if (m_mainPlayer) {
+    m_playerStorage->savePlayer(m_mainPlayer);
+    m_mainPlayer->setClientContext({});
+    m_mainPlayer->setStatistics({});
+  }
+
+  m_mainPlayer = player;
+
+  if (m_mainPlayer) {
+    m_mainPlayer->setClientContext(m_clientContext);
+    m_mainPlayer->setStatistics(m_statistics);
+    m_mainPlayer->setUniverseClient(this);
+    m_playerStorage->backupCycle(m_mainPlayer->uuid());
+    m_playerStorage->savePlayer(m_mainPlayer);
+    m_playerStorage->moveToFront(m_mainPlayer->uuid());
+  }
+}
+
+PlayerPtr UniverseClient::mainPlayer() const {
+  return m_mainPlayer;
+}
+
+Maybe<String> UniverseClient::connect(UniverseConnection connection, bool allowAssetsMismatch, String const& account, String const& password, bool const& forceLegacy) {
+  auto& root = Root::singleton();
+  auto assets = root.assets();
+
+  reset();
+  m_disconnectReason = {};
+
+  if (!m_mainPlayer)
+    throw StarException("Cannot call UniverseClient::connect with no main player");
+
+  unsigned timeout = assets->json("/client.config:serverConnectTimeout").toUInt();
+  Logger::info("UniverseClient: Connecting to server, packet timeout is {}ms", timeout);
+
+  {
+    auto protocolRequest = make_shared<ProtocolRequestPacket>(StarProtocolVersion);
+    if (!forceLegacy) {
+      protocolRequest->setCompressionMode(PacketCompressionMode::Enabled);
+      // Signal that we're OpenStarbound. Vanilla Starbound only compresses
+      // packets above 64 bytes - by forcing it, we can communicate this.
+    }
+    connection.pushSingle(protocolRequest);
+  }
+  connection.sendAll(timeout);
+  connection.receiveAny(timeout);
+
+  auto nextPacket = connection.pullSingle();
+  auto protocolResponsePacket = as<ProtocolResponsePacket>(nextPacket);
+  if (!nextPacket)
+    return String("Join failed! Expected ProtocolResponse, but none received");
+  else if (!protocolResponsePacket)
+    return String(strf("Join failed! Expected ProtocolResponse, got {}", PacketTypeNames.getRight(nextPacket->type())));
+  else if (!protocolResponsePacket->allowed)
+    return String(strf("Join failed! Server does not support connections with protocol version {}", StarProtocolVersion));
+
+  NetCompatibilityRules compatibilityRules;
+  compatibilityRules.setVersion(LegacyVersion);
+  bool legacyServer = forceLegacy || (protocolResponsePacket->compressionMode() != PacketCompressionMode::Enabled);
+  if (!legacyServer) {
+    auto compressedSocket = as<CompressedPacketSocket>(&connection.packetSocket());
+    if (protocolResponsePacket->info) {
+      compatibilityRules.setVersion(protocolResponsePacket->info.getUInt("openProtocolVersion", 1));
+      auto compressionName = protocolResponsePacket->info.getString("compression", "None");
+      if (compressedSocket) {
+        auto compressionMode = NetCompressionModeNames.maybeLeft(compressionName);
+        if (!compressionMode)
+          return String(strf("Join failed! Unknown net stream connection type '{}'", compressionName));
+
+        Logger::info("UniverseClient: Using '{}' network stream compression", NetCompressionModeNames.getRight(*compressionMode));
+        compressedSocket->setCompressionStreamEnabled(compressionMode == NetCompressionMode::Zstd);
+      }
+    } else {
+      compatibilityRules.setVersion(1); // A version of 1 is OpenStarbound prior to the NetElement compatibility stuff
+      if (compressedSocket) {
+        Logger::info("UniverseClient: Defaulting to Zstd network stream compression (older server version)");
+        compressedSocket->setCompressionStreamEnabled(true);
+      }
+    }
+  }
+  connection.packetSocket().setNetRules(compatibilityRules);
+  auto clientUuid = (m_storageDirectoryLock && root.configuration()->getPath("consistentClientUuid").optBool().value(false)) ? m_uuid : m_mainPlayer->uuid();
+  auto clientConnect = make_shared<ClientConnectPacket>(Root::singleton().assets()->digest(), allowAssetsMismatch, clientUuid, m_mainPlayer->name(),
+      m_mainPlayer->shipSpecies(), m_playerStorage->loadShipData(m_mainPlayer->uuid()), m_mainPlayer->shipUpgrades(),
+      m_mainPlayer->log()->introComplete(), account);
+  clientConnect->info = JsonObject{
+    {"brand", "OpenStarbound"},
+    {"openProtocolVersion", OpenProtocolVersion }
+  };
+  connection.pushSingle(std::move(clientConnect));
+  connection.sendAll(timeout);
+
+  connection.receiveAny(timeout);
+  auto packet = connection.pullSingle();
+  if (auto challenge = as<HandshakeChallengePacket>(packet)) {
+    Logger::info("UniverseClient: Sending Handshake Response");
+    ByteArray passAccountSalt = (password + account).utf8Bytes();
+    passAccountSalt.append(challenge->passwordSalt);
+    ByteArray passHash = Star::sha256(passAccountSalt);
+
+    connection.pushSingle(make_shared<HandshakeResponsePacket>(passHash));
+    connection.sendAll(timeout);
+
+    connection.receiveAny(timeout);
+    packet = connection.pullSingle();
+  }
+
+  if (auto success = as<ConnectSuccessPacket>(packet)) {
+    m_universeClock = make_shared<Clock>();
+    m_clientContext = make_shared<ClientContext>(success->serverUuid, m_mainPlayer->uuid(), clientUuid);
+    m_clientContext->setNetCompatibilityRules(compatibilityRules);
+    m_teamClient = make_shared<TeamClient>(m_mainPlayer, m_clientContext);
+    m_mainPlayer->setClientContext(m_clientContext);
+    m_mainPlayer->setStatistics(m_statistics);
+    m_worldClient = make_shared<WorldClient>(m_mainPlayer, m_luaRoot, this);
+    m_worldClient->clientState().setNetCompatibilityRules(compatibilityRules);
+    m_worldClient->setAsyncLighting(true);
+
+    m_connection = std::move(connection);
+    m_celestialDatabase = make_shared<CelestialSlaveDatabase>(std::move(success->celestialInformation));
+    m_systemWorldClient = make_shared<SystemWorldClient>(m_universeClock, m_celestialDatabase, m_mainPlayer->universeMap());
+
+    Logger::info("UniverseClient: Joined {} server as client {}", legacyServer ? "Starbound" : "OpenStarbound", success->clientId);
+    return {};
+  } else if (auto failure = as<ConnectFailurePacket>(packet)) {
+    Logger::error("UniverseClient: Join failed: {}", failure->reason);
+    return failure->reason;
+  } else if (packet) {
+    return String(strf("Join failed! Expected ConnectSuccess/Failure, got {}", PacketTypeNames.getRight(packet->type())));
+  } else {
+    return String("Join failed! Expected ConnectSuccess/Failure, but none received");
+  }
+
+  return {};
+}
+
+bool UniverseClient::isConnected() const {
+  return m_connection && m_connection->isOpen();
+}
+
+void UniverseClient::disconnect() {
+  auto assets = Root::singleton().assets();
+  int timeout = assets->json("/client.config:serverDisconnectTimeout").toInt();
+
+  if (isConnected()) {
+    Logger::info("UniverseClient: Client disconnecting...");
+    m_connection->pushSingle(make_shared<ClientDisconnectRequestPacket>());
+  }
+
+  // Try to handle all the shutdown packets before returning.
+  while (m_connection) {
+    m_connection->sendAll(timeout);
+    if (m_connection->receiveAny(timeout))
+      handlePackets(m_connection->pull());
+    else
+      break;
+  }
+
+  GlobalTimescale = 1.0f;
+  reset();
+  m_mainPlayer = {};
+}
+
+Maybe<String> UniverseClient::disconnectReason() const {
+  return m_disconnectReason;
+}
+
+unsigned UniverseClient::connectionVersion() {
+  return m_connection->packetSocket().netRules().version();
+}
+
+WorldClientPtr UniverseClient::worldClient() const {
+  return m_worldClient;
+}
+
+SystemWorldClientPtr UniverseClient::systemWorldClient() const {
+  return m_systemWorldClient;
+}
+
+void UniverseClient::update(float dt) {
+  auto assets = Root::singleton().assets();
+
+  if (!isConnected())
+    return;
+
+  if (!m_warping && !m_pendingWarp) {
+    if (auto playerWarp = m_mainPlayer->pullPendingWarp())
+      warpPlayer(parseWarpAction(playerWarp->action), (bool)playerWarp->animation, playerWarp->animation.value("default"), playerWarp->deploy);
+  }
+
+  if (m_pendingWarp) {
+    // completely forbid warps to custom worlds on old servers to prevent issues
+    if (m_connection->packetSocket().netRules().version() < 15) {
+      if (auto warpToWorld = m_pendingWarp.ptr<WarpToWorld>()) {
+        if (warpToWorld->world.is<CustomWorldId>() || warpToWorld->world.is<ClientCustomWorldId>()) {
+          Logger::warn("Attempting to warp to a custom world on an old server, cancelling.");
+          m_pendingWarp = WarpAction();
+          m_warping.reset();
+          m_warpDelay.reset();
+        }
+      }
+    }
+  }
+  if (m_pendingWarp) {
+    if ((m_warping && !m_mainPlayer->isTeleportingOut()) || (!m_warping && m_warpDelay.tick(dt))) {
+      m_connection->pushSingle(make_shared<PlayerWarpPacket>(take(m_pendingWarp), m_mainPlayer->isDeploying()));
+      m_warpDelay.reset();
+      if (m_warping) {
+        m_warpCinemaCancelTimer = GameTimer(assets->json("/client.config:playerWarpCinemaMinimumTime").toFloat());
+
+        bool isDeploying = m_mainPlayer->isDeploying();
+        String cinematicJsonPath = isDeploying ? "/client.config:deployCinematic" : "/client.config:warpCinematic";
+        String cinematicAssetPath = assets->json(cinematicJsonPath).toString()
+        .replaceTags(StringMap<String>{{"species", m_mainPlayer->species()}});
+
+        Json cinematic = jsonMerge(assets->json(cinematicJsonPath + "Base"), assets->json(cinematicAssetPath));
+        m_mainPlayer->setPendingCinematic(cinematic);
+      }
+    }
+  }
+
+  // Don't cancel the warp cinema until at LEAST the
+  // playerWarpCinemaMinimumTime has passed, even if warping is faster than
+  // that.
+  if (m_warpCinemaCancelTimer) {
+    m_warpCinemaCancelTimer->tick();
+    if (m_warpCinemaCancelTimer->ready() && !m_warping) {
+      m_warpCinemaCancelTimer = {};
+      m_mainPlayer->setPendingCinematic(Json());
+      m_mainPlayer->teleportIn();
+    }
+  }
+
+  m_connection->receive();
+  try {
+    handlePackets(m_connection->pull());
+  }
+  catch (StarException const& e) {
+    Logger::error("Exception caught handling incoming server packets {}", outputException(e, true));
+    reset();
+    if (!m_disconnectReason)
+      m_disconnectReason = String("Exception caught handling incoming server packets, check log");
+  }
+
+  if (!isConnected())
+    return;
+
+  LogMap::set("universe_time_client", m_universeClock->time());
+
+  m_statistics->update();
+
+  if (!*m_pause) {
+    m_worldClient->update(dt);
+    for (auto& p : m_scriptContexts)
+      p.second->update();
+  }
+  m_connection->push(m_worldClient->getOutgoingPackets());
+  if (m_connection->packetSocket().netRules().version() >= 16) {
+    for (auto& p : m_subWorldThreads) {
+      m_connection->push(p.second->pullOutgoingPackets());
+    }
+  }
+  
+  for (auto const& uuid : m_universeMessagePromises.keys()) {
+    if (m_universeMessagePromises[uuid].finished()) {
+      if (m_universeMessagePromises[uuid].succeeded()) {
+        m_connection->pushSingle(make_shared<UniverseMessageResponse>(makeRight(*m_universeMessagePromises[uuid].result()), uuid));
+      } else {
+        m_connection->pushSingle(make_shared<UniverseMessageResponse>(makeLeft(*m_universeMessagePromises[uuid].error()), uuid));
+      }
+      m_universeMessagePromises.remove(uuid);
+    }
+  }
+  
+  RecursiveMutexLocker messageLocker(m_messageMutex);
+  List<Message> messages = std::move(m_universeMessages);
+  messageLocker.unlock();
+  
+  for (auto& message : messages) {
+    auto keeper = message.keeper.get<RpcPromiseKeeper<Json>>();
+    if (auto resp = receiveMessage(message.message, true, message.args))
+      if (resp->is<RpcPromise<Json>>())
+        keeper.chain(resp->get<RpcPromise<Json>>());
+      else
+        keeper.fulfill(resp->get<Json>());
+    else
+      keeper.fail("Message not handled by universe");
+  }
+
+  if (!*m_pause)
+    m_systemWorldClient->update(dt);
+  m_connection->push(m_systemWorldClient->pullOutgoingPackets());
+
+  m_teamClient->update();
+  for (auto& result : m_teamClient->pullInviteResults()) {
+    String printout;
+    if (auto pair = result.ptr<std::pair<String, bool>>()) {
+      printout = strf(pair->second ? "Invited {}" : "Couldn't find anyone to invite named {}", pair->first);
+    } else if (auto invited = result.ptr<StringList>()) {
+      printout = "";
+      for (size_t i = 0; i != invited->size(); ++i) {
+        String& name = invited->at(i);
+        if (!printout.empty())
+          printout += (i == invited->size() - 1) ? "^reset;, and " : "^reset;, ";
+        printout += name;
+      }
+      printout = "Invited " + printout;
+    }
+    m_pendingMessages.emplaceAppend(MessageContext::CommandResult, 0, "", printout);
+  }
+
+  auto contextUpdate = m_clientContext->writeUpdate(m_clientContext->netCompatibilityRules());
+  if (!contextUpdate.empty())
+    m_connection->pushSingle(make_shared<ClientContextUpdatePacket>(std::move(contextUpdate)));
+
+  auto celestialRequests = m_celestialDatabase->pullRequests();
+  if (!celestialRequests.empty())
+    m_connection->pushSingle(make_shared<CelestialRequestPacket>(std::move(celestialRequests)));
+
+  m_connection->send();
+
+  if (Time::monotonicMilliseconds() >= m_storageTriggerDeadline) {
+    if (m_mainPlayer) {
+      m_playerStorage->savePlayer(m_mainPlayer);
+      if (playerIsOriginal())
+        m_playerStorage->moveToFront(m_mainPlayer->uuid());
+    }
+
+    m_storageTriggerDeadline = Time::monotonicMilliseconds() + assets->json("/client.config:storageTriggerInterval").toUInt();
+    
+    // clean up inactive/errored subworlds as well
+    for (auto const& subWorldId : m_subWorldThreads.keys()) {
+      auto thread = m_subWorldThreads.get(subWorldId);
+      if (thread->errorOccurred() || thread->shouldExpire()) {
+        Logger::info("UniverseClient: Cleaning up subworld {}.",subWorldId);
+        thread->stop();
+        thread->clearMessages();
+        m_subWorldThreads.remove(subWorldId);
+        if (m_subWorlds.hasLeftValue(subWorldId)) {
+          m_subWorlds.removeLeft(subWorldId);
+          m_connection->pushSingle(make_shared<ClientSubWorldRequest>(subWorldId, WorldId()));
+        }
+      }
+    }
+  }
+
+  if (!m_worldClient->mainPlayerDead() || m_mainPlayer->modeConfig().permadeath) {
+    m_respawnWarped = m_respawning = false;
+  } else if (m_respawning) {
+    if (m_respawnTimer.tick(dt)) {
+      bool ownShip = playerOnOwnShip();
+      if (ownShip || m_worldClient->respawnInWorld()) {
+        m_worldClient->reviveMainPlayer();
+        m_respawning = false;
+      } else if (!ownShip && !m_respawnWarped) {
+        if (m_respawnTimer.time > 0.f) {
+          String cinematic = assets->json("/client.config:respawnCinematic").toString();
+          cinematic = cinematic.replaceTags(StringMap<String>{
+            {"species", m_mainPlayer->species()},
+            {"mode", PlayerModeNames.getRight(m_mainPlayer->modeType())}});
+          m_mainPlayer->setPendingCinematic(Json(std::move(cinematic)));
+        }
+        m_respawnWarped = true;
+        m_pendingWarp = WarpAlias::OwnShip;
+        m_warpDelay.reset();
+        m_respawning = false;
+      }
+    }
+  } else if (m_respawnWarped) {
+    if (m_respawnTimer.tick(dt) && playerOnOwnShip()) {
+      m_worldClient->reviveMainPlayer();
+      m_respawnWarped = m_respawning = false;
+    }
+  } else {
+    m_respawning = true;
+    m_respawnTimer.reset();
+  }
+
+  m_celestialDatabase->cleanup();
+
+  if (auto netStats = m_connection->incomingStats()) {
+    LogMap::set("net_total_incoming", strf("{:4.3f} kB/s", netStats->bytesPerSecond / 1000.f));
+    LogMap::set("net_worst_incoming", strf("^cyan;{}^reset; ({:4.3f} kB/s)", PacketTypeNames.getRight(netStats->worstPacketType), (float)netStats->worstPacketSize / 1000.f));
+  }
+  if (auto netStats = m_connection->outgoingStats()) {
+    LogMap::set("net_total_outgoing", strf("{:4.3f} kB/s", netStats->bytesPerSecond / 1000.f));
+    LogMap::set("net_worst_outgoing", strf("^cyan;{}^reset; ({:4.3f} kB/s)", PacketTypeNames.getRight(netStats->worstPacketType), (float)netStats->worstPacketSize / 1000.f));
+  }
+}
+
+Maybe<BeamUpRule> UniverseClient::beamUpRule() const {
+  if (auto worldTemplate = currentTemplate())
+    if (auto parameters = worldTemplate->worldParameters())
+      return parameters->beamUpRule;
+
+  return {};
+}
+
+bool UniverseClient::canBeamUp() const {
+  auto playerWorldId = m_clientContext->playerWorldId();
+
+  if (playerWorldId.empty() || playerWorldId.is<ClientShipWorldId>())
+    return false;
+  if (m_mainPlayer->isAdmin())
+    return true;
+  if (m_mainPlayer->isDead() || m_mainPlayer->isTeleporting())
+    return false;
+
+  auto beamUp = beamUpRule();
+  if (beamUp == BeamUpRule::Anywhere || beamUp == BeamUpRule::AnywhereWithWarning)
+    return true;
+  else if (beamUp == BeamUpRule::Surface)
+    return mainPlayer()->modeConfig().allowBeamUpUnderground || mainPlayer()->isOutside();
+
+  return false;
+}
+
+bool UniverseClient::canBeamDown(bool deploy) const {
+  if (!m_clientContext->orbitWarpAction() || flying())
+    return false;
+  if (auto warpAction = m_clientContext->orbitWarpAction()) {
+    if (!deploy && warpAction->second == WarpMode::DeployOnly)
+      return false;
+    else if (deploy && (warpAction->second == WarpMode::BeamOnly || !m_mainPlayer->canDeploy()))
+      return false;
+  }
+  if (m_mainPlayer->isAdmin())
+    return true;
+  if (m_mainPlayer->isDead() || m_mainPlayer->isTeleporting() || !m_clientContext->shipUpgrades().capabilities.contains("teleport"))
+    return false;
+  return true;
+}
+
+bool UniverseClient::canBeamToTeamShip() const {
+  auto playerWorldId = m_clientContext->playerWorldId();
+  if (playerWorldId.empty())
+    return false;
+
+  if (m_mainPlayer->isAdmin())
+    return true;
+
+  if (canBeamUp())
+    return true;
+
+  if (playerWorldId.is<ClientShipWorldId>() && m_clientContext->shipUpgrades().capabilities.contains("teleport"))
+    return true;
+
+  return false;
+}
+
+bool UniverseClient::canTeleport() const {
+  if (m_mainPlayer->isAdmin())
+    return true;
+
+  if (m_clientContext->playerWorldId().is<ClientShipWorldId>())
+    return !flying() && m_clientContext->shipUpgrades().capabilities.contains("teleport");
+
+  return m_mainPlayer->canUseTool();
+}
+
+void UniverseClient::warpPlayer(WarpAction const& warpAction, bool animate, String const& animationType, bool deploy) {
+  // don't interrupt teleportation in progress
+  if (m_warping || m_respawning)
+    return;
+
+  m_mainPlayer->stopLounging();
+
+  // Check if the warp target is within the same world
+  if (auto warpToWorld = warpAction.ptr<WarpToWorld>()) {
+    if (warpToWorld->world.empty() || warpToWorld->world == playerWorld()) {
+      if (auto pos = warpToWorld->target.ptr<SpawnTargetPosition>()) {
+        m_mainPlayer->moveTo(*pos);
+        return;
+      }
+    }
+  }
+
+  if (animate) {
+    m_mainPlayer->teleportOut(animationType, deploy);
+    m_warping = warpAction;
+    m_warpDelay.reset();
+  }
+
+  m_pendingWarp = warpAction;
+}
+
+void UniverseClient::flyShip(Vec3I const& system, SystemLocation const& destination, Json const& settings) {
+  m_connection->pushSingle(make_shared<FlyShipPacket>(system, destination, settings));
+}
+
+CelestialDatabasePtr UniverseClient::celestialDatabase() {
+  return m_celestialDatabase;
+}
+
+CelestialCoordinate UniverseClient::shipCoordinate() const {
+  return m_clientContext->shipCoordinate();
+}
+
+bool UniverseClient::playerOnOwnShip() const {
+  return playerWorld().is<ClientShipWorldId>() && playerWorld().get<ClientShipWorldId>() == m_clientContext->clientUuid();
+}
+
+bool UniverseClient::playerIsOriginal() const {
+  return m_clientContext->playerUuid() == mainPlayer()->uuid();
+}
+
+WorldId UniverseClient::playerWorld() const {
+  return m_clientContext->playerWorldId();
+}
+
+bool UniverseClient::isAdmin() const {
+  return m_mainPlayer->isAdmin();
+}
+
+Uuid UniverseClient::teamUuid() const {
+  if (auto team = m_teamClient->currentTeam())
+    return *team;
+  return m_clientContext->clientUuid();
+}
+
+WorldTemplateConstPtr UniverseClient::currentTemplate() const {
+  return m_worldClient->currentTemplate();
+}
+
+SkyConstPtr UniverseClient::currentSky() const {
+  return m_worldClient->currentSky();
+}
+
+bool UniverseClient::flying() const {
+  if (auto sky = currentSky())
+    return sky->flying();
+  return false;
+}
+
+void UniverseClient::sendChat(String const& text, ChatSendMode sendMode, Maybe<bool> speak, Maybe<JsonObject> data) {
+  if (speak.value(!text.beginsWith("/")))
+    m_mainPlayer->addChatMessage(text);
+  auto packet = make_shared<ChatSendPacket>(text, sendMode);
+  if (data)
+    packet->data = std::move(*data);
+  m_connection->pushSingle(packet);
+}
+
+List<ChatReceivedMessage> UniverseClient::pullChatMessages() {
+  return take(m_pendingMessages);
+}
+
+uint16_t UniverseClient::players() {
+  return m_serverInfo.apply([](auto const& info) { return info.players; }).value(1);
+}
+
+uint16_t UniverseClient::maxPlayers() {
+  return m_serverInfo.apply([](auto const& info) { return info.maxPlayers; }).value(1);
+}
+
+void UniverseClient::setLuaCallbacks(String const& groupName, LuaCallbacks const& callbacks) {
+  m_luaRoot->addCallbacks(groupName, callbacks);
+}
+
+void UniverseClient::restartLua() {
+  m_luaRoot->restart();
+  auto clientConfig = Root::singleton().assets()->json("/client.config");
+  m_luaRoot->tuneAutoGarbageCollection(clientConfig.getFloat("luaGcPause"), clientConfig.getFloat("luaGcStepMultiplier"));
+  auto enableImGui = Root::singleton().configuration()->getPath("safe.enableImGui");
+  if (enableImGui && enableImGui.toBool())
+    m_luaRoot->luaEngine().addImGui();
+}
+
+void UniverseClient::startLuaScripts() {
+  auto assets = Root::singleton().assets();
+  for (auto& p : assets->json("/client.config:universeScriptContexts").toObject()) {
+    auto scriptComponent = make_shared<ScriptComponent>();
+    scriptComponent->setLuaRoot(m_luaRoot);
+    scriptComponent->setScripts(jsonToStringList(p.second.toArray()));
+    
+    scriptComponent->addThreadCallbacks("universe",LuaBindings::makeUniverseClientThreadCallbacks(this));
+
+    m_scriptContexts.set(p.first, scriptComponent);
+    scriptComponent->init();
+  }
+}
+
+void UniverseClient::stopLua() {
+  for (auto& p : m_scriptContexts)
+    p.second->uninit();
+
+  m_scriptContexts.clear();
+}
+
+LuaRootPtr UniverseClient::luaRoot() {
+  return m_luaRoot;
+}
+
+bool UniverseClient::reloadPlayer(Json const& data, Uuid const&, bool resetInterfaces, bool showIndicator) {
+  auto player = mainPlayer();
+  bool playerInWorld = player->inWorld();
+  auto world = as<WorldClient>(player->world());
+
+  EntityId entityId = (playerInWorld || !world->inWorld())
+    ? player->entityId()
+    : connectionEntitySpace(world->connection()).first;
+
+  if (m_playerReloadPreCallback)
+    m_playerReloadPreCallback(resetInterfaces);
+
+  ProjectilePtr indicator;
+
+  if (playerInWorld) {
+    if (showIndicator) {
+      // EntityCreatePacket for player entities can be pretty big.
+      // We can show a loading projectile to other players while the create packet uploads.
+      auto projectileDb = Root::singleton().projectileDatabase();
+      auto config = projectileDb->projectileConfig("opensb:playerloading");
+      indicator = projectileDb->createProjectile("stationpartsound", config);
+      indicator->setInitialPosition(player->position());
+      indicator->setInitialDirection({ 1.0f, 0.0f });
+      world->addEntity(indicator);
+    }
+
+    world->removeEntity(player->entityId(), false);
+  } else {
+    m_respawning = false;
+    m_respawnTimer.reset();
+  }
+
+  Json originalData = m_playerStorage->savePlayer(player);
+  std::exception_ptr exception;
+
+  try {
+    auto newData = data.set("movementController", originalData.get("movementController"));
+    player->diskLoad(newData);
+  }
+  catch (std::exception const& e) {
+    player->diskLoad(originalData);
+    exception = std::current_exception();
+  }
+
+  world->addEntity(player, entityId);
+
+  if (indicator && indicator->inWorld())
+    world->removeEntity(indicator->entityId(), false);
+
+  CelestialCoordinate coordinate = m_systemWorldClient->location();
+  player->universeMap()->addMappedCoordinate(coordinate);
+  player->universeMap()->filterMappedObjects(coordinate, m_systemWorldClient->objectKeys());
+
+  if (m_playerReloadCallback)
+    m_playerReloadCallback(resetInterfaces);
+
+  if (exception)
+    std::rethrow_exception(exception);
+
+  return true;
+}
+
+bool UniverseClient::switchPlayer(Uuid const& uuid) {
+  if (uuid == mainPlayer()->uuid())
+    return false;
+  else if (auto data = m_playerStorage->maybeGetPlayerData(uuid)) {
+    if (reloadPlayer(*data, uuid, true, true)) {
+      if (auto dance = Root::singleton().assets()->json("/player.config").optString("swapDance"))
+        m_mainPlayer->humanoid()->setDance(*dance);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool UniverseClient::switchPlayer(size_t index) {
+  if (auto uuid = m_playerStorage->playerUuidAt(index))
+    return switchPlayer(*uuid);
+  else
+    return false;
+}
+
+bool UniverseClient::switchPlayer(String const& name) {
+  if (auto uuid = m_playerStorage->playerUuidByName(name, mainPlayer()->uuid()))
+    return switchPlayer(*uuid);
+  else if (name.utf8Size() == UuidSize * 2)
+    return switchPlayer(Uuid(name));
+  else
+    return false;
+}
+
+UniverseClient::ReloadPlayerCallback& UniverseClient::playerReloadPreCallback() {
+  return m_playerReloadPreCallback;
+}
+
+UniverseClient::ReloadPlayerCallback& UniverseClient::playerReloadCallback() {
+  return m_playerReloadCallback;
+}
+
+ClockConstPtr UniverseClient::universeClock() const {
+  return m_universeClock;
+}
+
+JsonRpcInterfacePtr UniverseClient::rpcInterface() const {
+  return m_clientContext->rpcInterface();
+}
+
+ClientContextPtr UniverseClient::clientContext() const {
+  return m_clientContext;
+}
+
+TeamClientPtr UniverseClient::teamClient() const {
+  return m_teamClient;
+}
+
+QuestManagerPtr UniverseClient::questManager() const {
+  return m_mainPlayer->questManager();
+}
+
+PlayerStoragePtr UniverseClient::playerStorage() const {
+  return m_playerStorage;
+}
+
+StatisticsPtr UniverseClient::statistics() const {
+  return m_statistics;
+}
+
+UniverseClient::ScriptComponentPtr UniverseClient::scriptContext(String const& contextName) {
+  if (auto context = m_scriptContexts.ptr(contextName))
+    return *context;
+  else
+    return nullptr;
+}
+
+void UniverseClient::createCustomWorld(String const& name, Json templateData) {
+  if (!m_storageDirectoryLock)
+    return;
+  RecursiveMutexLocker locker(m_mutex);
+  String filename = File::relativeTo(m_storageDirectory, strf("{}.world", name));
+  if (!File::exists(filename)) {
+    m_connection->pushSingle(make_shared<ClientCustomWorldCreate>(name, templateData));
+  }
+}
+
+ClientSubWorldId UniverseClient::createSubWorld() {
+  auto swid = m_subWorldThreads.nextId();
+  auto thread = make_shared<WorldClientThread>(swid,this);
+  thread->setPause(m_pause);
+  thread->start();
+  m_subWorldThreads.add(swid,thread);
+  return swid;
+}
+
+void UniverseClient::setSubWorldWorld(ClientSubWorldId subWorldId, WorldId worldId) {
+  // asks to change worlds. the server's response will update the thread (in WorldStop and WorldStart packets)
+  if (m_connection->packetSocket().netRules().version() < 16) {
+    // server too old, don't.
+    Logger::error("UniverseClient: Not setting subworld world, server is too old.");
+    return;
+  }
+  if (worldId) {
+    if (m_subWorlds.hasRightValue(worldId)) {
+      Logger::error("UniverseClient: Not setting subworld world, one is already on world {}.",worldId);
+      return;
+    }
+    Logger::info("UniverseClient: Requesting subworld {} on world {}", subWorldId, worldId);
+    m_subWorlds.add(subWorldId,worldId);
+  } else if (m_subWorlds.hasLeftValue(subWorldId)) {
+    // clear the world
+    Logger::info("UniverseClient: Requesting destroy of subworld {}", subWorldId, worldId);
+    m_subWorlds.removeLeft(subWorldId);
+  }
+  m_connection->pushSingle(make_shared<ClientSubWorldRequest>(subWorldId,worldId));
+}
+
+bool UniverseClient::subWorldExistsOnWorld(WorldId worldId) const {
+  return m_subWorlds.hasRightValue(worldId);
+}
+
+ClientSubWorldId UniverseClient::getSubWorldOnWorld(WorldId worldId) {
+  // will always return a subworld id for a world. creates one if one is not present.
+  if (m_subWorlds.hasRightValue(worldId)) {
+    return m_subWorlds.getLeft(worldId); // a subworld already exists here, return that
+  }
+  ClientSubWorldId swid = 0;
+  for (auto const& p : m_subWorldThreads) {
+    if (p.second->errorOccurred()) {
+      continue;
+    }
+    if (!m_subWorlds.hasLeftValue(p.first)) {
+      swid = p.first; // reuse an existing subworld
+      break;
+    }
+  }
+  if (swid == 0) {
+    swid = createSubWorld(); // create a new one
+  }
+  if (worldId) {
+    setSubWorldWorld(swid, worldId);
+  }
+  return swid;
+}
+
+void UniverseClient::destroySubWorldOnWorld(WorldId worldId) {
+  if (!m_subWorlds.hasRightValue(worldId)) {
+    return;
+  }
+  setSubWorldWorld(m_subWorlds.getLeft(worldId), WorldId());
+}
+
+RpcPromise<Json> UniverseClient::sendSubWorldOnWorldMessage(WorldId const& worldId, String const& message, JsonArray const& args) {
+  if (m_connection->packetSocket().netRules().version() < 16) {
+    return RpcPromise<Json>::createFailed("Server too old");
+  }
+  auto subWorldId = getSubWorldOnWorld(worldId);
+  auto pair = RpcPromise<Json>::createPair();
+  m_subWorldThreads.get(subWorldId)->passMessage({message, args, pair.second});
+  return pair.first;
+}
+
+// though it resolves instantly, still use a promise for consistency
+RpcPromise<Json> UniverseClient::sendMainWorldMessage(String const& message, JsonArray const& args) {
+  if (!isConnected()) {
+    return RpcPromise<Json>::createFailed("Not connected");
+  }
+  if (auto resp = m_worldClient->receiveMessage(ServerConnectionId, message, args)) {
+    if (resp->is<RpcPromise<Json>>())
+      return resp->get<RpcPromise<Json>>();
+    else
+      return RpcPromise<Json>::createFulfilled(resp->get<Json>());
+  } else {
+    return RpcPromise<Json>::createFailed("Message not handled by world");
+  }
+}
+
+bool UniverseClient::paused() const {
+  return *m_pause;
+}
+
+void UniverseClient::setPause(bool pause) {
+  *m_pause = pause;
+
+  if (pause)
+    m_universeClock->stop();
+  else
+    m_universeClock->start();
+}
+
+void UniverseClient::handlePackets(List<PacketPtr> const& packets) {
+  for (auto const& packet : packets) {
+    try {
+      bool skip = false;
+      Maybe<Json> packetJson;
+      auto functionName = strf("on{}Packet", PacketTypeNames.getRight(packet->type()));
+      for (auto& context : m_scriptContexts) {
+        auto& luaContext = *context.second->context();
+        auto method = luaContext.get(functionName);
+        if (method != LuaNil) {
+          if (!packetJson)
+            packetJson = packet->writeJson();
+          if ((skip = luaContext.luaTo<LuaFunction>(std::move(method)).invoke<LuaValue>(*packetJson).maybe<LuaBoolean>().value())) {
+            break;
+          }
+        }
+      }
+      if (skip)
+        continue;
+
+      if (auto clientContextUpdate = as<ClientContextUpdatePacket>(packet)) {
+        m_clientContext->readUpdate(clientContextUpdate->updateData, m_clientContext->netCompatibilityRules());
+        m_playerStorage->applyShipUpdates(m_clientContext->playerUuid(), m_clientContext->newShipUpdates());
+        
+        auto customWorldUpdates = m_clientContext->newCustomWorldUpdates();
+        if (!customWorldUpdates.empty() && m_storageDirectoryLock) {
+          RecursiveMutexLocker locker(m_mutex);
+          for (auto p : customWorldUpdates) {
+            if (!p.second.empty()) {
+              if (p.first.contains("../") || p.first.contains("..\\")) {
+                Logger::error("Not saving custom world named {}, path attempts to go up.", p.first);
+              } else {
+                String filePath = File::relativeTo(m_storageDirectory, strf("{}.world", p.first));
+                WorldStorage::applyWorldChunksUpdateToFile(filePath, p.second);
+              }
+            }
+          }
+        }
+
+        if (playerIsOriginal()) {
+          m_mainPlayer->setShipUpgrades(m_clientContext->shipUpgrades());
+          if (playerOnOwnShip() && m_mainPlayer->inWorld()) {
+            auto shipSpecies = m_mainPlayer->world()->getProperty("ship.species");
+            if (shipSpecies.isType(Json::Type::String))
+              m_mainPlayer->setShipSpecies(shipSpecies.toString());
+          }
+        }
+
+        m_mainPlayer->setAdmin(m_clientContext->isAdmin());
+        m_mainPlayer->setTeam(m_clientContext->team());
+
+      } else if (auto chatReceivePacket = as<ChatReceivePacket>(packet)) {
+        m_pendingMessages.append(chatReceivePacket->receivedMessage);
+
+      } else if (auto universeTimeUpdatePacket = as<UniverseTimeUpdatePacket>(packet)) {
+        m_universeClock->setTime(universeTimeUpdatePacket->universeTime);
+
+      } else if (auto serverDisconnectPacket = as<ServerDisconnectPacket>(packet)) {
+        reset();
+        m_disconnectReason = serverDisconnectPacket->reason;
+        break; // Stop handling other packets
+
+      } else if (auto celestialResponse = as<CelestialResponsePacket>(packet)) {
+        m_celestialDatabase->pushResponses(std::move(celestialResponse->responses));
+
+      } else if (auto warpResult = as<PlayerWarpResultPacket>(packet)) {
+        if (m_mainPlayer->isDeploying() && m_warping && m_warping->is<WarpToPlayer>()) {
+          Uuid target = m_warping->get<WarpToPlayer>();
+          for (auto member : m_teamClient->members()) {
+            if (member.uuid == target) {
+              if (member.warpMode != WarpMode::DeployOnly && member.warpMode != WarpMode::BeamOrDeploy)
+                m_mainPlayer->deployAbort();
+              break;
+            }
+          }
+        }
+
+        m_warping.reset();
+        if (!warpResult->success) {
+          m_mainPlayer->teleportAbort();
+          if (warpResult->warpActionInvalid)
+            m_mainPlayer->universeMap()->invalidateWarpAction(warpResult->warpAction);
+        }
+      } else if (auto planetTypeUpdate = as<PlanetTypeUpdatePacket>(packet)) {
+        m_celestialDatabase->invalidateCacheFor(planetTypeUpdate->coordinate);
+      } else if (auto pausePacket = as<PausePacket>(packet)) {
+        setPause(pausePacket->pause);
+        GlobalTimescale = clamp(pausePacket->timescale, 0.0f, 1024.f);
+      } else if (auto serverInfoPacket = as<ServerInfoPacket>(packet)) {
+        m_serverInfo = ServerInfo{serverInfoPacket->players, serverInfoPacket->maxPlayers};
+      } else if (auto clientCustomWorldRequest = as<ClientCustomWorldRequest>(packet)) {
+        Logger::info("UniverseClient: Received request for client custom world {}.", clientCustomWorldRequest->name);
+        if (!m_storageDirectoryLock) {
+          Logger::error("Rejecting custom world {}, client lacks universe lock.", clientCustomWorldRequest->name);
+          m_connection->pushSingle(make_shared<ClientCustomWorldResponse>(clientCustomWorldRequest->name, WorldChunks()));
+        } else if (clientCustomWorldRequest->name.contains("../") || clientCustomWorldRequest->name.contains("..\\")) {
+          Logger::error("Rejecting custom world name {}, path attempts to go up.", clientCustomWorldRequest->name);
+          m_connection->pushSingle(make_shared<ClientCustomWorldResponse>(clientCustomWorldRequest->name, WorldChunks()));
+        } else {
+          RecursiveMutexLocker locker(m_mutex);
+          String filename = File::relativeTo(m_storageDirectory, strf("{}.world", clientCustomWorldRequest->name));
+          if (File::exists(filename)) {
+            try {
+                m_connection->pushSingle(make_shared<ClientCustomWorldResponse>(clientCustomWorldRequest->name, WorldStorage::getWorldChunksFromFile(filename)));
+            } catch (StarException const& e) {
+              Logger::error("Failed to load custom world file {} : {}", filename, outputException(e, false));
+              m_connection->pushSingle(make_shared<ClientCustomWorldResponse>(clientCustomWorldRequest->name, WorldChunks()));
+            }
+          } else {
+            Logger::error("Custom world file {} does not exist", filename);
+            m_connection->pushSingle(make_shared<ClientCustomWorldResponse>(clientCustomWorldRequest->name, WorldChunks()));
+          }
+        }
+      } else if (auto worldLoadNotification = as<NotifyWorldLoad>(packet)) {
+        if (auto customWorldId = worldLoadNotification->worldId.ptr<ClientCustomWorldId>()) {
+          if (customWorldId->uuid == m_clientContext->clientUuid()) {
+            for (auto& p : m_scriptContexts) {
+              p.second->invoke("clientCustomWorldLoaded",customWorldId->name,printWorldId(worldLoadNotification->worldId));
+            }
+          }
+        } else if (auto shipWorldId = worldLoadNotification->worldId.ptr<ClientShipWorldId>()) {
+          if (*shipWorldId == m_clientContext->clientUuid()) {
+            for (auto& p : m_scriptContexts) {
+              p.second->invoke("shipWorldLoaded",printWorldId(worldLoadNotification->worldId));
+            }
+          }
+        }
+        for (auto& p : m_scriptContexts) {
+          p.second->invoke("serverWorldLoaded",printWorldId(worldLoadNotification->worldId));
+        }
+      } else if (auto cwtReject = as<ClientSubWorldReject>(packet)) {
+        Logger::warn("UniverseClient: Subworld {} rejected by server", cwtReject->subWorldId);
+        if (m_subWorlds.hasLeftValue(cwtReject->subWorldId)) {
+          m_subWorlds.removeLeft(cwtReject->subWorldId);
+          // thread will time out on its own if left unused.
+        }
+        if (m_subWorldThreads.contains(cwtReject->subWorldId)) {
+          // though do make sure to clear messages so their promises are considered rejected.
+          auto worldThread = m_subWorldThreads.get(cwtReject->subWorldId);
+          worldThread->clearMessages();
+        }
+        for (auto& p : m_scriptContexts) {
+          p.second->invoke("subWorldRejected",cwtReject->subWorldId);
+        }
+      } else if (auto cwtPacket = as<ClientSubWorldPackets>(packet)) {
+        // packets for a world thread
+        if (m_subWorldThreads.contains(cwtPacket->subWorldId)) {
+          auto worldThread = m_subWorldThreads.get(cwtPacket->subWorldId);
+          worldThread->pushIncomingPackets(cwtPacket->packets);
+        } else {
+          Logger::warn("UniverseClient: Received packets for non-existent subworld {}", cwtPacket->subWorldId);
+        }
+      } else if (auto logMapUpdate = as<LogMapUpdate>(packet)) {
+        for (auto& p : logMapUpdate->map) {
+          LogMap::setValue(p.first,p.second);
+        }
+      } else if (auto universeMessage = as<UniverseMessage>(packet)) {
+        if (auto response = receiveMessage(universeMessage->message, false, universeMessage->args)) {
+          if (response->is<Json>()) {
+            m_connection->pushSingle(make_shared<UniverseMessageResponse>(makeRight(response->get<Json>()), universeMessage->uuid));
+          } else {
+            // delay the response until this promise is done
+            m_universeMessagePromises[universeMessage->uuid] = response->get<RpcPromise<Json>>();
+          } 
+        } else
+          m_connection->pushSingle(make_shared<UniverseMessageResponse>(makeLeft("Message not handled by universe"), universeMessage->uuid));
+      } else if (auto universeMessageResponse = as<UniverseMessageResponse>(packet)) {
+        RecursiveMutexLocker messageLocker(m_messageMutex);
+        if (!m_universeMessageResponses.contains(universeMessageResponse->uuid))
+          Logger::warn("UniverseClient: UniverseMessageResponse received for unknown context [{}]!", universeMessageResponse->uuid.hex());
+        else {
+          auto response = m_universeMessageResponses.take(universeMessageResponse->uuid);
+          if (universeMessageResponse->response.isRight())
+            response.fulfill(universeMessageResponse->response.right());
+          else
+            response.fail(universeMessageResponse->response.left());
+        }
+      } else if (!m_systemWorldClient->handleIncomingPacket(packet)) {
+        // see if the system world will handle it, otherwise pass it along to the world client
+        m_worldClient->handleIncomingPackets({packet});
+      }
+    }
+    catch (StarException const& e) {
+      Logger::error("Exception thrown while handling {} packet", PacketTypeNames.getRight(packet->type()));
+      throw;
+    }
+  }
+}
+
+void UniverseClient::reset() {
+  stopLua();
+  for (auto const& p : m_subWorldThreads) {
+    p.second->stop();
+  }
+
+  m_subWorlds.clear();
+  m_subWorldThreads.clear();
+  m_universeClock.reset();
+  m_worldClient.reset();
+  m_celestialDatabase.reset();
+  m_clientContext.reset();
+  m_teamClient.reset();
+  m_warping.reset();
+  m_respawning = m_respawnWarped = false;
+
+  auto assets = Root::singleton().assets();
+  m_warpDelay = GameTimer(assets->json("/client.config:playerWarpDelay").toFloat());
+  m_respawnTimer = GameTimer(assets->json("/client.config:playerReviveTime").toFloat());
+
+  if (m_mainPlayer)
+    m_playerStorage->savePlayer(m_mainPlayer);
+
+  m_connection.reset();
+  
+  RecursiveMutexLocker messageLocker(m_messageMutex);
+  m_universeMessageResponses = {};
+  m_universeMessagePromises = {};
+  messageLocker.unlock();
+}
+
+void UniverseClient::passMessage(Universe::Message&& message) {
+  RecursiveMutexLocker locker(m_messageMutex);
+  m_universeMessages.append(std::move(message));
+}
+
+RpcPromise<Json> UniverseClient::sendUniverseMessage(ConnectionId const& connectionId, String const& message, JsonArray const& args) {
+  if (connectionId == m_clientContext->connectionId()) {
+    auto pair = RpcPromise<Json>::createPair();
+    passMessage({message,args,pair.second});
+    return pair.first;
+  } else {
+    if (connectionVersion() < 18) {
+      return RpcPromise<Json>::createFailed("Server is not new enough");
+    }
+    auto pair = RpcPromise<Json>::createPair();
+    Uuid uuid;
+    RecursiveMutexLocker messageLocker(m_messageMutex);
+    m_universeMessageResponses[uuid] = pair.second;
+    messageLocker.unlock();
+    m_connection->pushSingle(make_shared<UniverseMessage>(connectionId, message, args, uuid));
+    return pair.first;
+  }
+}
+
+Maybe<ChainableJsonMessageResponse> UniverseClient::receiveMessage(String const& message, bool const& local, JsonArray const& args) {
+  Maybe<ChainableJsonMessageResponse> result;
+  for (auto& p : m_scriptContexts) {
+    result = p.second->handleMessage(message, local, args);
+    if (result)
+      break;
+  }
+  return result;
+}
+
+}

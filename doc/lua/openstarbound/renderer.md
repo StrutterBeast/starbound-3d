@@ -1,0 +1,46 @@
+# Renderer
+
+The new `renderer` table is accessible from almost every clientside script and allows configuring shaders.
+
+---
+
+#### `void` renderer.setPostProcessGroupEnabled(`String` group, `bool` enabled, [`bool` save])
+
+Enables or disables a post process shader group. If save is true, this change is saved to configuration as well.
+
+---
+
+#### `bool` renderer.postProcessGroupEnabled(`String` group)
+
+Returns true if the specified post process group is enabled.
+
+---
+
+#### `Json` renderer.postProcessGroups()
+
+Returns every post process group. Identical to grabbing them from client.config with root.assetJson.
+
+---
+
+#### `Json` renderer.setEffectParameter(`String` effectName, `String` parameterName, `Json` value)
+
+Sets the specified scriptable parameter of the specified shader effect to the provided value. 
+This is accessed from the shader as a uniform and must be defined in the effect's configuration.
+
+---
+
+#### `Json` renderer.getEffectParameter(`String` effectName, `String` parameterName)
+
+Returns the specified scriptable parameter of the specified shader effect.
+
+---
+
+#### `Json` renderer.setTexture(`String` effectName, `Variant<Image,String>` value)
+
+Sets the specified renderer texture to contain the specified image.
+
+---
+
+#### `Json` renderer.setPostProcessLayerPasses(`String` layerName, `unsigned` passes)
+
+Sets the number of passes for the specified post process layer. This requires the layer be named.

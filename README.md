@@ -1,5 +1,14 @@
 # starbound-3d
-You’ve fled your home, only to find yourself lost in space with a damaged ship. Your only option is to beam down to the planet below, repair your ship and set off to explore the universe but 3d and vr with no al
+You’ve fled your home, only to find yourself lost in space with a damaged ship. Your only option is to beam down to the planet below, repair your ship and set off to explore the universe..
+
+# is it going made with ai?
+no and i have a firm stance against Al.
+
+# will it have vr support?
+yes it will have vr support.
+
+3d and what does that mean?
+it mean not be 2D game. it made in 3d assets and 3d game.
 
 # Bounty Hunter Update
 In our latest update take on the role of an intergalactic bounty hunter, taking on new quests to track down wanted criminal gangs and following clues to discover their hideouts.

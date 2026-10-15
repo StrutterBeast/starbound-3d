@@ -49,7 +49,7 @@ Starbound has been built from the ground up to be multiplayer and easily moddabl
 
 # more info
 
-Choose from one of 7 playable races and customize your character
+Choose from one of 10playable races and customize your character are Apex, Avian, Floran, Glitch, Human, Hylotl, Novakid, avali, protogen, and sergul. 
 
 Save the universe in an epic story campaign featuring colorful characters, bosses, dungeons, and quests!
 

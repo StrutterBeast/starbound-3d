@@ -1,4 +1,4 @@
-# starbound-3d
+ # starbound-3d
 You’ve fled your home, only to find yourself lost in space with a damaged ship. Your only option is to beam down to the planet below, repair your ship and set off to explore the universe..
 
 # is it going made with ai?
@@ -49,7 +49,7 @@ Starbound has been built from the ground up to be multiplayer and easily moddabl
 
 # more info
 
-Choose from one of 10playable races and customize your character are Apex, Avian, Floran, Glitch, Human, Hylotl, Novakid, avali, protogen, and sergul. 
+Choose from one of 10 playable races and customize your character are Apex, Avian, Floran, Glitch, Human, Hylotl, Novakid, avali, protogen, and sergul. 
 
 Save the universe in an epic story campaign featuring colorful characters, bosses, dungeons, and quests!
 
